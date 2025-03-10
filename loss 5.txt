@@ -1,3 +1,92 @@
+def batched_nms(
+    self,
+    boxes, 
+    scores, 
+    class_ids, 
+    iou_threshold=0.5, 
+    score_threshold=0.05, 
+    max_detections=300
+):
+    """
+    Apply non-maximum suppression to avoid detecting too many overlapping bounding boxes.
+    
+    Args:
+        boxes: Tensor of shape [N, 4] with bounding boxes in format [x1, y1, x2, y2]
+        scores: Tensor of shape [N] with confidence scores
+        class_ids: Tensor of shape [N] with class IDs
+        iou_threshold: IoU threshold for NMS
+        score_threshold: Minimum score threshold
+        max_detections: Maximum number of detections to keep
+        
+    Returns:
+        Tensor of indices of kept boxes
+    """
+    # Check if inputs are tensors and flatten them if they have too many dimensions
+    if isinstance(boxes, torch.Tensor) and boxes.dim() > 2:
+        original_shape = boxes.shape
+        boxes = boxes.reshape(-1, 4)
+        
+    if isinstance(scores, torch.Tensor) and scores.dim() > 1:
+        scores = scores.reshape(-1)
+        
+    if isinstance(class_ids, torch.Tensor) and class_ids.dim() > 1:
+        class_ids = class_ids.reshape(-1)
+        
+    # Filter out boxes with low confidence
+    if isinstance(scores, torch.Tensor) and scores.numel() > 0:
+        mask = scores > score_threshold
+        boxes = boxes[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+    
+    if not isinstance(boxes, torch.Tensor) or boxes.numel() == 0:
+        return torch.zeros(0, device=boxes.device if isinstance(boxes, torch.Tensor) else 'cpu', dtype=torch.int64)
+    
+    # Apply per-class NMS
+    # For each class, apply NMS and keep track of selected indices
+    keep_indices = []
+    unique_classes = torch.unique(class_ids)
+    
+    for cls in unique_classes:
+        cls_mask = class_ids == cls
+        # Apply NMS for this class
+        cls_boxes = boxes[cls_mask]
+        cls_scores = scores[cls_mask]
+        
+        # Use torchvision's NMS implementation
+        try:
+            cls_keep = torchvision.ops.nms(cls_boxes, cls_scores, iou_threshold)
+            
+            # Map back to original indices
+            cls_indices = torch.nonzero(cls_mask, as_tuple=True)[0]
+            keep_indices.append(cls_indices[cls_keep])
+        except Exception as e:
+            print(f"Error in NMS for class {cls}: {e}")
+            continue
+    
+    # Combine all kept indices
+    if keep_indices and len(keep_indices) > 0:
+        keep = torch.cat(keep_indices)
+        
+        # Sort by score and limit to max_detections
+        _, order = scores[keep].sort(descending=True)
+        keep = keep[order]
+        
+        # Limit to max_detections
+        if len(keep) > max_detections:
+            keep = keep[:max_detections]
+            
+        return keep
+    else:
+        return torch.zeros(0, device=boxes.device, dtype=torch.int64)
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
