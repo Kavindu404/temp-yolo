@@ -1,0 +1,40 @@
+# Default configuration for YOLO with ResNet backbone
+
+# Model parameters
+model:
+  input_size: 640
+  num_classes: 80  # COCO has 80 classes
+
+# Dataloader parameters
+dataloader:
+  num_workers: 4
+  pin_memory: true
+
+# Augmentation parameters
+augmentation:
+  mosaic_prob: 0.5
+  copy_paste_prob: 0.3
+  hsv_prob: 0.5
+  flip_prob: 0.5
+  scale: [0.5, 1.5]
+  translate: 0.1
+  degrees: 10.0
+
+# Optimizer parameters
+optimizer:
+  lr: 0.001
+  weight_decay: 0.0005
+  momentum: 0.937
+
+# Scheduler parameters
+scheduler:
+  T_max: 100
+  eta_min: 0.00001
+
+# Loss parameters
+loss:
+  box_gain: 0.05
+  cls_gain: 0.5
+  obj_gain: 1.0
+  seg_gain: 1.0
+  focal_loss_gamma: 2.0
