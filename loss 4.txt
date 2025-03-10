@@ -1,0 +1,421 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Tuple
+
+
+class YOLOLoss(nn.Module):
+    """
+    YOLO loss function for both object detection and segmentation
+    """
+    
+    def __init__(
+        self, 
+        num_classes: int = 80,
+        device: torch.device = torch.device('cuda'),
+        iou_threshold: float = 0.5,
+        box_gain: float = 0.05,
+        cls_gain: float = 0.5,
+        obj_gain: float = 1.0,
+        seg_gain: float = 1.0,
+        focal_loss_gamma: float = 2.0
+    ):
+        super(YOLOLoss, self).__init__()
+        
+        self.num_classes = num_classes
+        self.device = device
+        self.iou_threshold = iou_threshold
+        
+        # Loss weights
+        self.box_gain = box_gain
+        self.cls_gain = cls_gain
+        self.obj_gain = obj_gain
+        self.seg_gain = seg_gain
+        
+        # Focal loss gamma for classification
+        self.focal_loss_gamma = focal_loss_gamma
+        
+        # Define anchor boxes for each scale
+        # These are example anchor boxes, you should tune these for your dataset
+        self.anchors = {
+            'p1': torch.tensor([[10, 13], [16, 30], [33, 23]], device=device) / 32,  # Small anchors
+            'p2': torch.tensor([[30, 61], [62, 45], [59, 119]], device=device) / 32,  # Medium anchors
+            'p3': torch.tensor([[116, 90], [156, 198], [373, 326]], device=device) / 32,  # Large anchors
+            'p4': torch.tensor([[116, 90], [156, 198], [373, 326]], device=device) / 32,  # Same as p3
+        }
+        
+        # Grid cell offsets
+        self.grid = {}
+        
+    def forward(
+        self, 
+        det_outputs: Dict[str, torch.Tensor], 
+        seg_output: torch.Tensor,
+        targets: List[torch.Tensor],
+        masks: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute YOLO loss
+        
+        Args:
+            det_outputs: Detection outputs from YOLO model for each scale
+                         Format: dict of [B, H, W, A, 5+C]
+            seg_output: Segmentation output from YOLO model
+                        Format: [B, C, H, W]
+            targets: List of target tensors
+                     Format: list of [num_boxes, 5] (class, x, y, w, h)
+            masks: Batch of segmentation masks
+                   Format: [B, H, W]
+            
+        Returns:
+            Dictionary of loss components
+        """
+        # Initialize loss components
+        box_loss = torch.tensor(0.0, device=self.device)
+        cls_loss = torch.tensor(0.0, device=self.device)
+        obj_loss = torch.tensor(0.0, device=self.device)
+        
+        # Process each scale
+        for scale, output in det_outputs.items():
+            anchors = self.anchors[scale]
+            
+            # Get predictions
+            B, H, W, A, _ = output.shape
+            pred_boxes = output[..., 0:4]  # tx, ty, tw, th
+            pred_obj = output[..., 4]      # objectness
+            pred_cls = output[..., 5:-1]   # class probabilities
+            
+            # Convert predictions to absolute coordinates
+            self._create_grid(H, W, device=output.device)
+            pred_xy = torch.sigmoid(pred_boxes[..., 0:2]) + self.grid[f"{H}_{W}"]
+            pred_wh = torch.exp(pred_boxes[..., 2:4]) * anchors.view(1, 1, 1, A, 2)
+            
+            # Normalized coordinates [0, 1]
+            pred_xy = pred_xy / torch.tensor([W, H], device=self.device)
+            pred_wh = pred_wh / torch.tensor([W, H], device=self.device)
+            
+            # Build target tensors
+            target_obj = torch.zeros_like(pred_obj)
+            target_cls = torch.zeros_like(pred_cls)
+            target_boxes = torch.zeros_like(pred_boxes)
+            
+            # Process each image in batch
+            for b in range(B):
+                if targets[b].shape[0] == 0:
+                    continue
+                
+                # Get targets for this image
+                t_cls = targets[b][:, 0].long()
+                t_box = targets[b][:, 1:5]  # x, y, w, h
+                
+                # Convert to grid coordinates
+                t_xy = t_box[:, 0:2] * torch.tensor([W, H], device=self.device)
+                t_wh = t_box[:, 2:4] * torch.tensor([W, H], device=self.device)
+                
+                # Find best anchor for each target
+                wh_ratio = t_wh[:, None] / anchors[None]
+                ratio_max = torch.max(wh_ratio, 1 / wh_ratio).max(2)[0]
+                best_anchor = ratio_max.argmin(1)
+                
+                # Get grid cell indices
+                t_xy_i = t_xy.long()
+                
+                # Add target values for matched cells only
+                for i, anchor_idx in enumerate(best_anchor):
+                    # Grid cell coordinates
+                    j, k = t_xy_i[i]
+                    
+                    # Ensure we're within bounds
+                    if j < W and k < H:
+                        # Objectness target
+                        target_obj[b, k, j, anchor_idx] = 1.0
+                        
+                        # Class target
+                        target_cls[b, k, j, anchor_idx, t_cls[i]] = 1.0
+                        
+                        # Box target
+                        target_boxes[b, k, j, anchor_idx, 0:2] = t_xy[i] - t_xy[i].long()
+                        target_boxes[b, k, j, anchor_idx, 2:4] = torch.log(t_wh[i] / anchors[anchor_idx] + 1e-10)
+            
+            # Compute box loss (for cells with objects)
+            obj_mask = target_obj > 0
+            
+            if obj_mask.sum() > 0:
+                # Apply sigmoid to predicted xy
+                pred_boxes_sig = pred_boxes.clone()
+                pred_boxes_sig[..., 0:2] = torch.sigmoid(pred_boxes[..., 0:2])
+                
+                # Compute box loss (IoU-based)
+                iou = self._bbox_iou(
+                    self._xywh2xyxy(self._decode_boxes(pred_boxes_sig[obj_mask])),
+                    self._xywh2xyxy(self._decode_boxes(target_boxes[obj_mask]))
+                )
+                box_loss += (1.0 - iou).mean()
+                
+                # Compute classification loss (Binary Cross Entropy)
+                cls_loss += F.binary_cross_entropy_with_logits(
+                    pred_cls[obj_mask], 
+                    target_cls[obj_mask]
+                )
+            
+            # Compute objectness loss
+            obj_loss += F.binary_cross_entropy_with_logits(
+                pred_obj, 
+                target_obj
+            )
+        
+        # Compute segmentation loss
+        seg_loss = self._compute_segmentation_loss(seg_output, masks)
+        
+        # Apply weights to losses
+        box_loss = self.box_gain * box_loss
+        cls_loss = self.cls_gain * cls_loss
+        obj_loss = self.obj_gain * obj_loss
+        seg_loss = self.seg_gain * seg_loss
+        
+        # Total loss
+        total_loss = box_loss + cls_loss + obj_loss + seg_loss
+        
+        return {
+            'total': total_loss,
+            'box': box_loss,
+            'cls': cls_loss,
+            'obj': obj_loss,
+            'seg': seg_loss
+        }
+    
+    def _compute_segmentation_loss(
+        self, 
+        seg_output: torch.Tensor,
+        masks: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute segmentation loss
+        
+        Args:
+            seg_output: Segmentation output from model [B, C, H, W]
+            masks: Ground truth masks [B, H, W]
+            
+        Returns:
+            Segmentation loss
+        """
+        # Print shapes for debugging
+        B, C, H, W = seg_output.shape
+        
+        # Resize masks to match prediction size if needed
+        if masks.shape[1] != H or masks.shape[2] != W:
+            masks_resized = F.interpolate(
+                masks.float().unsqueeze(1), 
+                size=(H, W), 
+                mode='nearest'
+            ).long().squeeze(1)
+        else:
+            masks_resized = masks
+            
+        # Clamp mask values to valid class range [0, C-1]
+        # This ensures all indices are within the valid range for cross-entropy
+        masks_resized = torch.clamp(masks_resized, 0, C-1)
+        
+        # Apply small weight to background class to focus more on objects
+        # Create class weights: background has lower weight, objects higher
+        class_weights = torch.ones(C, device=seg_output.device)
+        class_weights[0] = 0.1  # Lower weight for background class
+        
+        # Compute standard cross entropy loss with class weights
+        seg_loss = F.cross_entropy(
+            seg_output, 
+            masks_resized,
+            weight=class_weights,
+            ignore_index=-1  # In case there are any invalid pixels
+        )
+        
+        return seg_loss
+    
+    def _create_grid(self, h: int, w: int, device: torch.device) -> None:
+        """
+        Create a grid of (x,y) coordinates for each grid cell
+        
+        Args:
+            h: Grid height
+            w: Grid width
+            device: Computation device
+        """
+        key = f"{h}_{w}"
+        if key not in self.grid:
+            # Create grid
+            y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device))
+            grid = torch.stack((x, y), dim=2).view(1, h, w, 1, 2).float()
+            self.grid[key] = grid
+    
+    def _decode_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Decode box predictions to actual coordinates
+        
+        Args:
+            boxes: Box predictions [N, 4] (tx, ty, tw, th)
+            
+        Returns:
+            Decoded boxes [N, 4] (x, y, w, h)
+        """
+        return boxes
+    
+    def _xywh2xyxy(self, boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Convert [x, y, w, h] to [x1, y1, x2, y2]
+        
+        Args:
+            boxes: Boxes in [x, y, w, h] format
+            
+        Returns:
+            Boxes in [x1, y1, x2, y2] format
+        """
+        x, y, w, h = boxes.unbind(-1)
+        x1 = x - w / 2
+        y1 = y - h / 2
+        x2 = x + w / 2
+        y2 = y + h / 2
+        return torch.stack((x1, y1, x2, y2), dim=-1)
+    
+    def _bbox_iou(self, box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+        """
+        Compute IoU between boxes
+        
+        Args:
+            box1: First set of boxes [N, 4] (x1, y1, x2, y2)
+            box2: Second set of boxes [N, 4] (x1, y1, x2, y2)
+            eps: Small constant to avoid division by zero
+            
+        Returns:
+            IoU values [N]
+        """
+        # Get intersection area
+        x1 = torch.max(box1[..., 0], box2[..., 0])
+        y1 = torch.max(box1[..., 1], box2[..., 1])
+        x2 = torch.min(box1[..., 2], box2[..., 2])
+        y2 = torch.min(box1[..., 3], box2[..., 3])
+        
+        intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+        
+        # Get box areas
+        w1 = box1[..., 2] - box1[..., 0]
+        h1 = box1[..., 3] - box1[..., 1]
+        w2 = box2[..., 2] - box2[..., 0]
+        h2 = box2[..., 3] - box2[..., 1]
+        
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        
+        # Compute IoU
+        union = box1_area + box2_area - intersection + eps
+        iou = intersection / union
+        
+        return iou
+    
+    def get_predictions(self, det_outputs: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Get predictions from model outputs
+        
+        Args:
+            det_outputs: Detection outputs from YOLO model
+            
+        Returns:
+            List of predictions for each image [N, 6] (x1, y1, x2, y2, conf, cls)
+        """
+        batch_size = next(iter(det_outputs.values())).size(0)
+        all_predictions = []
+        
+        # Process each image in batch
+        for b in range(batch_size):
+            predictions = []
+            
+            # Process each scale
+            for scale, output in det_outputs.items():
+                anchors = self.anchors[scale]
+                
+                # Get grid dimensions
+                _, H, W, A, _ = output.shape
+                
+                # Extract predictions
+                pred = output[b].reshape(-1, output.shape[-1])
+                
+                # Apply sigmoid to objectness and class predictions
+                pred_obj = torch.sigmoid(pred[:, 4])
+                pred_cls = torch.sigmoid(pred[:, 5:-1])
+                
+                # Get class with highest probability
+                pred_cls_max, pred_cls_idx = pred_cls.max(1)
+                
+                # Confidence = objectness * class probability
+                conf = pred_obj * pred_cls_max
+                
+                # Filter by confidence threshold
+                mask = conf > 0.25  # Confidence threshold
+                if not mask.any():
+                    all_predictions.append(torch.zeros((0, 6), device=self.device))
+                    continue
+                
+                # Get filtered predictions
+                filtered_pred = pred[mask]
+                filtered_conf = conf[mask]
+                filtered_cls_idx = pred_cls_idx[mask]
+                
+                # Get grid cells and anchors for each prediction
+                grid_x = torch.arange(W, device=self.device).repeat(H, 1).reshape(H*W)
+                grid_y = torch.arange(H, device=self.device).repeat(W, 1).t().reshape(H*W)
+                anchor_idx = torch.arange(A, device=self.device).repeat(H*W, 1).t().reshape(-1)
+                
+                # Create grid for all combinations
+                grid = torch.stack([grid_x.repeat(A), grid_y.repeat(A), anchor_idx], dim=1)[mask]
+                
+                # Extract box predictions
+                pred_xy = torch.sigmoid(filtered_pred[:, 0:2]) + grid[:, :2]
+                pred_wh = torch.exp(filtered_pred[:, 2:4]) * anchors[grid[:, 2].long()]
+                
+                # Normalized coordinates [0, 1]
+                pred_xy = pred_xy / torch.tensor([W, H], device=self.device)
+                pred_wh = pred_wh / torch.tensor([W, H], device=self.device)
+                
+                # Convert to [x1, y1, x2, y2]
+                pred_x1y1 = pred_xy - pred_wh / 2
+                pred_x2y2 = pred_xy + pred_wh / 2
+                
+                # Concatenate boxes, confidence, and class
+                pred_boxes = torch.cat([
+                    pred_x1y1, 
+                    pred_x2y2, 
+                    filtered_conf.unsqueeze(1),
+                    filtered_cls_idx.float().unsqueeze(1)
+                ], dim=1)
+                
+                predictions.append(pred_boxes)
+            
+            # Combine predictions from all scales
+            if len(predictions) > 0:
+                predictions = torch.cat(predictions, dim=0)
+                
+                # Apply non-maximum suppression
+                # This is a simplified version - a real implementation would use proper NMS
+                keep = []
+                while predictions.size(0) > 0:
+                    # Keep box with highest confidence
+                    keep.append(predictions[0].unsqueeze(0))
+                    if predictions.size(0) == 1:
+                        break
+                    
+                    # Compute IoU of the kept box with the rest
+                    ious = self._bbox_iou(predictions[0, :4].unsqueeze(0), predictions[1:, :4])
+                    
+                    # Filter boxes with IoU < threshold
+                    mask = ious < self.iou_threshold
+                    predictions = predictions[1:][mask]
+                
+                if keep:
+                    predictions = torch.cat(keep, dim=0)
+                else:
+                    predictions = torch.zeros((0, 6), device=self.device)
+            else:
+                predictions = torch.zeros((0, 6), device=self.device)
+            
+            all_predictions.append(predictions)
+        
+        return all_predictions
