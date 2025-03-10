@@ -1,3 +1,66 @@
+# Change this part of the calculate_map method:
+for img_id, (pred, gt) in enumerate(zip(pred_boxes, true_boxes)):
+    # Add image info
+    img_info = {"id": img_id, "file_name": f"img_{img_id}.jpg", "height": self.config['model']['input_size'], "width": self.config['model']['input_size']}
+    coco_gt["images"].append(img_info)
+    
+    # Add ground truth annotations
+    if isinstance(gt, torch.Tensor) and gt.size(0) > 0:
+        for box_idx in range(gt.size(0)):
+            box = gt[box_idx]
+            cls, x_center, y_center, width, height = box.cpu().numpy()
+            
+            # Convert to COCO format [x, y, width, height]
+            img_size = self.config['model']['input_size']
+            x = (x_center - width/2) * img_size
+            y = (y_center - height/2) * img_size
+            w = width * img_size
+            h = height * img_size
+            
+            area = w * h
+            
+            coco_gt["annotations"].append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": int(cls),
+                "bbox": [x, y, w, h],
+                "area": area,
+                "iscrowd": 0
+            })
+            ann_id += 1
+    elif isinstance(gt, list) and len(gt) > 0:
+        # Handle case where gt is a list
+        for box in gt:
+            if isinstance(box, torch.Tensor):
+                cls, x_center, y_center, width, height = box.cpu().numpy()
+                
+                # Convert to COCO format [x, y, width, height]
+                img_size = self.config['model']['input_size']
+                x = (x_center - width/2) * img_size
+                y = (y_center - height/2) * img_size
+                w = width * img_size
+                h = height * img_size
+                
+                area = w * h
+                
+                coco_gt["annotations"].append({
+                    "id": ann_id,
+                    "image_id": img_id,
+                    "category_id": int(cls),
+                    "bbox": [x, y, w, h],
+                    "area": area,
+                    "iscrowd": 0
+                })
+                ann_id += 1
+
+
+
+
+
+
+
+
+
 import os
 import time
 import torch
